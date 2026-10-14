@@ -109,6 +109,7 @@ class Config:
     mention_all: bool
     heartbeat: int
     interval: int
+    proxy: str | None = None
 
     def summary(self) -> str:
         return f"推特列表 {self.list_id}" if self.list_id else "、".join("@" + a for a in self.accounts)
@@ -125,6 +126,13 @@ def _bool(k: str, default: bool) -> bool:
 
 def _list(k: str, split_space: bool = False) -> list[str]:
     return [x.strip() for x in re.split(r"[,，;；\s]+" if split_space else r"[,，;；\r\n]+", _env(k)) if x.strip()]
+
+
+def _proxy() -> str | None:
+    p = _env("TW_PROXY")  # e.g. http://192.168.1.10:7890 or socks5://...; needed where X is blocked
+    if not p or p.lower() in ("none", "off"):
+        return None
+    return p if "://" in p else "http://" + p
 
 
 def load_config() -> Config:
@@ -160,7 +168,7 @@ def load_config() -> Config:
                   retweets=_bool("INCLUDE_RETWEETS", False), replies=_bool("INCLUDE_REPLIES", False),
                   quotes=_bool("INCLUDE_QUOTES", True), keywords=_list("KEYWORDS"), exclude=_list("EXCLUDE_KEYWORDS"),
                   images=_bool("SEND_IMAGES", True), mention_all=_bool("WECOM_MENTION_ALL", False),
-                  heartbeat=hb if 0 <= hb <= 23 else -1, interval=90)
+                  heartbeat=hb if 0 <= hb <= 23 else -1, interval=90, proxy=_proxy())
 
 
 # ------------------------------------------------------------------ state (persisted by actions/cache)
@@ -368,7 +376,8 @@ ACCOUNT = "spare"
 
 class Twitter:
     def __init__(self, cfg: Config, wait_timeout: float | None = None):
-        self.api = API(pool=DB_FILE, raise_when_no_account=True, wait_timeout=wait_timeout, wait_interval=2)
+        self.api = API(pool=DB_FILE, proxy=cfg.proxy, raise_when_no_account=True,
+                       wait_timeout=wait_timeout, wait_interval=2)
 
     async def login(self, cfg: Config) -> None:
         await self.api.pool.add_account_cookies(ACCOUNT, f"auth_token={cfg.auth_token}; ct0={cfg.ct0}")
@@ -404,8 +413,9 @@ def explain_inactive(err: str) -> str:
 
 # ------------------------------------------------------------------ one run
 class Run:
-    def __init__(self, cfg: Config, state: State, http: httpx.AsyncClient):
+    def __init__(self, cfg: Config, state: State, http: httpx.AsyncClient, tw_http: httpx.AsyncClient | None = None):
         self.cfg, self.state, self.http = cfg, state, http
+        self.tw_http = tw_http or http  # for pbs.twimg.com images (goes through TW_PROXY)
         self.bot = WeCom(cfg.webhook, cfg.mention_all, http)
         self.tw = Twitter(cfg)
         self.account_dead = False
@@ -462,7 +472,7 @@ class Run:
 
     async def push(self, tw) -> bool:
         msg = format_tweet(tw)
-        imgs = await download_photos(msg.photos, self.http) if (self.cfg.images and msg.photos) else []
+        imgs = await download_photos(msg.photos, self.tw_http) if (self.cfg.images and msg.photos) else []
         ok = await self.bot.send_tweet(msg, imgs)
         if ok:
             log.info("pushed %s", msg.url)
@@ -537,8 +547,9 @@ async def run_once(loop_minutes: float) -> int:
     started = time.time()
     deadline = started + max(0.0, min(loop_minutes, 10.0)) * 60
     rounds = 0
-    async with httpx.AsyncClient(timeout=30, follow_redirects=True) as http:
-        r = Run(cfg, state, http)
+    async with httpx.AsyncClient(timeout=30, follow_redirects=True) as http, \
+            httpx.AsyncClient(timeout=30, follow_redirects=True, proxy=cfg.proxy) as tw_http:
+        r = Run(cfg, state, http, tw_http)
         try:
             await r.tw.login(cfg)
             await r.announce_if_changed()
@@ -569,7 +580,8 @@ async def run_test() -> int:
     except ConfigError as e:
         say(f"✗ {e}")
         return 1
-    say(f"[1/3] Configuration OK: watching {len(cfg.accounts)} account(s), sending to the 企业微信 group")
+    say(f"[1/3] Configuration OK: watching {len(cfg.accounts)} account(s), sending to the 企业微信 group"
+        + (", using a proxy for X" if cfg.proxy else ""))
     say("[2/3] Reading X with the spare account …")
     state = State()
     tw = Twitter(cfg, wait_timeout=20)
@@ -600,11 +612,12 @@ async def run_test() -> int:
     say(f"  ✓ Read {len(tweets)} posts")
     say("[3/3] Sending a test message to the 企业微信 group …")
     sample = max(tweets, key=lambda t: t.id)
-    async with httpx.AsyncClient(timeout=30, follow_redirects=True) as http:
+    async with httpx.AsyncClient(timeout=30, follow_redirects=True) as http, \
+            httpx.AsyncClient(timeout=30, follow_redirects=True, proxy=cfg.proxy) as tw_http:
         bot = WeCom(cfg.webhook, cfg.mention_all, http)
         ok = await bot.send_text(f"🔧 测试消息：推特监控配置成功！\n监控对象：{cfg.summary()}\n下面是一条最新推文的推送效果示例 👇")
         msg = format_tweet(sample, prefix="[示例] ")
-        ok = ok and await bot.send_tweet(msg, await download_photos(msg.photos, http) if cfg.images else [])
+        ok = ok and await bot.send_tweet(msg, await download_photos(msg.photos, tw_http) if cfg.images else [])
     say("  ✓ Sent — check the group. All checks passed ✅" if ok else "  ✗ Sending failed (see the error above)")
     return 0 if ok else 1
 
