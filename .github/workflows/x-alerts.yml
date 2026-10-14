@@ -54,7 +54,7 @@ jobs:
           restore-keys: x-alerts-state-
       - name: Test
         if: github.event_name == 'workflow_dispatch' && inputs.test
-        run: python xalerts.py --test
+        run: python xalerts.py --test || { python probe.py; exit 1; }
       - name: Check for new posts
         run: python xalerts.py
       - name: Save state
